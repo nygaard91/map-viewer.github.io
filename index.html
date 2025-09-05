@@ -13,17 +13,14 @@
       --viewer-max-h: 768px;
     }
 
-    /* Background grid */
+    /* Page baseline */
     body{
       margin:0;
       min-height:100vh;
       display:grid;
       place-items:center;
-      background-image: linear-gradient(to right, #f3e8e3 2px, transparent 2px),
-                        linear-gradient(to bottom, #f3e8e3 2px, transparent 2px);
-      background-color:#f7efeb;
-      background-size: var(--grid-size) var(--grid-size);
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background-color: #ffffff;
     }
 
     /* Viewer keeps a 4:3 ratio, up to 1024x768, but scales down responsively */
@@ -32,12 +29,10 @@
       width:min(100vw - 24px, var(--viewer-max-w));
       aspect-ratio: 4 / 3;
       max-height:min(100vh - 24px, var(--viewer-max-h));
-      background:#fff;
-      box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.2);
       overflow:hidden;
     }
 
-    /* Canvas holds the transformed image */
+    /* Canvas holds the transformed image and the background grid */
     .canvas{
       position:absolute; inset:0;
       overflow:hidden;
@@ -45,18 +40,32 @@
       cursor: grab;
       user-select: none;
       -webkit-user-select: none;
+      background-image: linear-gradient(to right, #f3e8e3 2px, transparent 2px),
+                        linear-gradient(to bottom, #f3e8e3 2px, transparent 2px);
+      background-color:#f7efeb;
+      background-size: var(--grid-size) var(--grid-size);
     }
     .canvas.grabbing{ cursor: grabbing; }
 
-    /* The map image is absolutely positioned and transformed from top-left (0,0) */
-    #mapImage{
+    /* NEW: wrapper layer that receives the transform and box-shadow */
+    .mapLayer{
       position:absolute; top:0; left:0;
       transform-origin: 0 0;
       will-change: transform;
-      image-rendering: auto; /* keep default smoothing */
-      pointer-events:none; /* allow dragging on the canvas */
+      pointer-events: none; /* gestures handled on .canvas */
+      box-shadow: 0 0 10px rgba(0,0,0,.2);
+    }
+
+    /* The image itself is “dumb” – it just fills the wrapper */
+    #mapImage{
+      display:block;
+      width:100%;
+      height:100%;
+      image-rendering: auto;       /* keep default smoothing */
+      pointer-events:none;
       user-drag: none; -webkit-user-drag: none;
       -webkit-touch-callout: none;
+      box-shadow: none;            /* IMPORTANT: no shadow on the <img> */
     }
 
     /* Controls: two minimal squares at bottom-right, horizontally aligned */
@@ -81,13 +90,16 @@
     }
     .ctrl:active{ transform: translateY(1px); }
     .ctrl:disabled{ opacity:.5; pointer-events:none; }
-    .visually-hidden{ position:absolute !important; clip: rect(1px, 1px, 1px, 1px); padding:0; border:0; height:1px; width:1px; overflow:hidden; white-space:nowrap; }
+    .visually-hidden{ position:absolute !important; clip: rect(1px, 1px, 1px, 1px); height:1px; width:1px; overflow:hidden; white-space:nowrap; }
   </style>
 </head>
 <body>
   <div class="viewer" id="viewer" aria-label="Map viewer">
     <div class="canvas" id="canvas" aria-live="polite">
-      <img id="mapImage" alt="Map" draggable="false" />
+      <!-- NEW wrapper -->
+      <div id="mapLayer" class="mapLayer">
+        <img id="mapImage" alt="Map" draggable="false" />
+      </div>
     </div>
 
     <!-- Minimal, textless controls -->
@@ -112,16 +124,19 @@
     /*** STATE ***/
     const viewer = document.getElementById('viewer');
     const canvas = document.getElementById('canvas');
-    const img = document.getElementById('mapImage');
-    const btnIn = document.getElementById('zoomIn');
+    const layer  = document.getElementById('mapLayer');   // NEW wrapper
+    const img    = document.getElementById('mapImage');
+    const btnIn  = document.getElementById('zoomIn');
     const btnOut = document.getElementById('zoomOut');
 
     let baseWidth = 0;   // natural width of the 1x asset (CSS width we lock to)
     let baseHeight = 0;  // natural height of the 1x asset
 
-    let baseScale = 1;        // scale that fits the whole image at zoom=1 within current viewport
-    let zoomIndex = 0;        // index into ZOOM_LEVELS
-    let translate = {x: 0, y: 0};
+    let baseScale = 1;     // fitted scale so that 1x fills viewer by contain
+    let translate = { x: 0, y: 0 };
+    let zoomIndex = 0;     // index into ZOOM_LEVELS
+
+    let assetRatio = 1;    // NEW: 0.5, 1, 1.5, 2, 2.5, 3
 
     // For interaction
     let isPanning = false;
@@ -148,27 +163,23 @@
     }
 
     function setTransform(){
-      // Apply transform to the CSS-sized image
-      img.style.transform = `translate(${translate.x}px, ${translate.y}px) scale(${currentScale()})`;
+      // Apply transform to the wrapper. Compensate for the asset's layout size.
+      layer.style.transform =
+        `translate(${translate.x}px, ${translate.y}px) scale(${currentScale()/assetRatio})`;
     }
 
     function computeBaseScale(){
-      // Ensure the full image is visible at zoom = 1 (fit/contain)
       const vp = viewport();
       baseScale = Math.min(vp.w / baseWidth, vp.h / baseHeight);
     }
 
     function clampTranslate(){
       const vp = viewport();
-      const s = currentScale();
-      const scaledW = baseWidth * s;
-      const scaledH = baseHeight * s;
+      const scaledW = baseWidth  * currentScale();
+      const scaledH = baseHeight * currentScale();
 
-      // If the scaled content is larger than viewport, clamp to edges; else center it.
       const minX = Math.min(0, vp.w - scaledW);
-      const maxX = Math.max(0, vp.w - scaledW); // if smaller than vp, this equals 0
       const minY = Math.min(0, vp.h - scaledH);
-      const maxY = Math.max(0, vp.h - scaledH);
 
       if (scaledW <= vp.w) {
         translate.x = (vp.w - scaledW) / 2; // center horizontally
@@ -184,11 +195,11 @@
     }
 
     function assetKeyFor(zoomIdx){
-      // Decide which image asset to use for a given zoom index, with responsive override for very small viewports.
+      // Decide which image asset to use for a given zoom index, with a small-viewport override.
       const vp = viewport();
       const zoomFactor = ZOOM_LEVELS[zoomIdx];
 
-      // Responsive rule: if the viewer is narrower than 512px and we're at the base zoom (1x), prefer the 0.5x asset.
+      // If the viewer is narrower than 512px and we're at the base zoom (1x), prefer the 0.5x asset.
       if (vp.w < 512 && zoomFactor <= 1) {
         return '0.5x';
       }
@@ -201,26 +212,31 @@
 
     function ensurePreloaded(key){
       if (assetCache.has(key)) return;
-      const pre = new Image();
-      pre.decoding = 'async';
-      pre.src = assetUrl(key);
-      assetCache.set(key, pre);
+      const im = new Image();
+      im.decoding = 'async';
+      im.src = assetUrl(key);
+      assetCache.set(key, im);
     }
 
-    async function switchAssetIfNeeded(){
-      const key = assetKeyFor(zoomIndex);
-      ensurePreloaded(key); // kick off immediately
+    function switchAssetIfNeeded(){
+      const key = assetKeyFor(zoomIndex); // e.g. '3x', '2x', '1.5x', '0.5x'
+      ensurePreloaded(key);
 
+      // Update the image source
       const cached = assetCache.get(key);
-      if (cached && cached.complete) {
-        img.src = cached.src; // avoid re-decoding if already loaded
-      } else {
-        img.src = assetUrl(key);
-      }
+      img.src = (cached && cached.complete) ? cached.src : assetUrl(key);
 
-      // Preload neighbors for snappy next zoom
+      // Grow/shrink the wrapper to match the asset's native pixels
+      assetRatio = parseFloat(key) || 1;
+      layer.style.width  = (baseWidth  * assetRatio) + 'px';
+      layer.style.height = (baseHeight * assetRatio) + 'px';
+
+      // Preload neighbors
       if (zoomIndex + 1 < ZOOM_LEVELS.length) ensurePreloaded(assetKeyFor(zoomIndex + 1));
       if (zoomIndex - 1 >= 0) ensurePreloaded(assetKeyFor(zoomIndex - 1));
+
+      // Re-apply transform so the on-screen size remains consistent
+      setTransform();
     }
 
     function updateButtons(){
@@ -228,11 +244,11 @@
       btnIn.disabled  = (zoomIndex === ZOOM_LEVELS.length - 1);
     }
 
-    function setZoomIndex(newIndex, opts={ preserve:"view-center" }){
+    function setZoomIndex(newIndex){
       newIndex = clamp(newIndex, 0, ZOOM_LEVELS.length - 1);
       const vp = viewport();
 
-      // Determine the image-space point to preserve (center of the current view by requirement)
+      // Keep the current view center stable while zooming
       const s1 = currentScale();
       const viewPoint = { x: vp.w/2, y: vp.h/2 };
       const imagePoint = { // convert from view-space to image-space (pre-transform)
@@ -249,28 +265,20 @@
       translate.y = viewPoint.y - imagePoint.y * s2;
 
       clampTranslate();
+      switchAssetIfNeeded(); // may change assetRatio
       setTransform();
-      switchAssetIfNeeded();
       updateButtons();
     }
 
     function zoomIn(){ setZoomIndex(zoomIndex + 1); }
     function zoomOut(){ setZoomIndex(zoomIndex - 1); }
 
-    /*** EVENT HANDLERS ***/
-    // Buttons
+    /*** UI HOOKUPS ***/
     btnIn.addEventListener('click', zoomIn);
     btnOut.addEventListener('click', zoomOut);
 
-    // Double click to zoom in (not on buttons)
-    canvas.addEventListener('dblclick', (e)=>{
-      e.preventDefault();
-      zoomIn();
-    });
-
     // Wheel to zoom (no modifiers)
     canvas.addEventListener('wheel', (e)=>{
-      // Only act if no ctrl/shift/alt/meta
       if (e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return;
       e.preventDefault();
       if (e.deltaY < 0) zoomIn(); else zoomOut();
@@ -300,22 +308,24 @@
       if (!activePointers.has(e.pointerId)) return;
       activePointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
 
-      if (activePointers.size === 1 && isPanning) {
-        const dx = e.clientX - panStart.x;
-        const dy = e.clientY - panStart.y;
-        translate.x = translateStart.x + dx;
-        translate.y = translateStart.y + dy;
-        clampTranslate();
-        setTransform();
-      } else if (activePointers.size === 2 && pinchInitial) {
+      if (activePointers.size === 2) {
         handlePinchGesture();
+        return;
       }
+
+      if (!isPanning) return;
+      const dx = e.clientX - panStart.x;
+      const dy = e.clientY - panStart.y;
+      translate.x = translateStart.x + dx;
+      translate.y = translateStart.y + dy;
+      clampTranslate();
+      setTransform();
     });
 
     function endPointer(e){
-      if (activePointers.has(e.pointerId)) {
-        activePointers.delete(e.pointerId);
-      }
+      if (!activePointers.has(e.pointerId)) return;
+      activePointers.delete(e.pointerId);
+
       if (activePointers.size === 0) {
         isPanning = false;
         pinchInitial = null;
@@ -331,9 +341,6 @@
 
     canvas.addEventListener('pointerup', endPointer);
     canvas.addEventListener('pointercancel', endPointer);
-    canvas.addEventListener('pointerleave', (e)=>{
-      // if a pointer is captured we shouldn't treat leave as end; rely on pointerup/cancel
-    });
 
     function computePinchState(){
       const pts = Array.from(activePointers.values());
@@ -348,13 +355,12 @@
     function handlePinchGesture(){
       const now = computePinchState();
       if (!now || !pinchInitial) return;
-      const scaleFactor = now.distance / pinchInitial.distance;
 
-      // Convert to desired absolute scale by applying factor to the starting scale
-      const vp = viewport();
-      const desiredTotalScale = baseScale * ZOOM_LEVELS[pinchInitial.zoomIndex] * scaleFactor;
+      // Pinch delta in native CSS scale units
+      const delta = now.distance / pinchInitial.distance;
+      const desiredTotalScale = baseScale * ZOOM_LEVELS[pinchInitial.zoomIndex] * delta;
 
-      // Snap to the nearest locked zoom level
+      // Snap to closest allowed zoom level
       let closestIdx = 0;
       let closestDiff = Infinity;
       for (let i=0;i<ZOOM_LEVELS.length;i++){
@@ -363,13 +369,11 @@
       }
 
       if (closestIdx !== zoomIndex) {
-        // Preserve the view center while zooming (as per requirement)
+        // Preserve the view center while zooming
         setZoomIndex(closestIdx);
       }
 
-      // Allow slight panning during pinch by updating translate toward pinch center
-      // (Optional subtle enhancement; keeps interaction feeling natural.)
-      // Here we simply re-clamp and set transform after potential zoom.
+      // clamp & apply
       clampTranslate();
       setTransform();
     }
@@ -391,26 +395,29 @@
         translate.x = center.x - imagePoint.x * newScale;
         translate.y = center.y - imagePoint.y * newScale;
         clampTranslate();
-        setTransform();
         switchAssetIfNeeded();
+        setTransform();
       });
     });
 
-    /*** INIT ***/
-    (async function init(){
-      // Load 1x first to establish base dimensions (logical size)
+    /*** BOOT ***/
+    (async function boot(){
+      // Decode 1x to read natural size
       const boot = new Image();
+      boot.decoding = 'async';
       boot.src = assetUrl('1x');
-      await boot.decode().catch(()=>{});
+      await boot.decode();
 
-      baseWidth = boot.naturalWidth;
-      baseHeight = boot.naturalHeight;
+      baseWidth  = boot.naturalWidth;   // 1024
+      baseHeight = boot.naturalHeight;  // 768
 
-      // Lock CSS dimensions to the 1x logical size so transforms and panning use a stable coordinate space
-      img.style.width = baseWidth + 'px';
-      img.style.height = baseHeight + 'px';
+      // Lock initial logical size on the wrapper
+      layer.style.width  = baseWidth + 'px';
+      layer.style.height = baseHeight + 'px';
 
-      // Put initial asset on screen (may be overridden to 0.5x if viewport <512px)
+      // Show the boot image immediately
+      img.src = boot.src;
+
       computeBaseScale();
       switchAssetIfNeeded();
 
