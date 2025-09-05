@@ -115,7 +115,10 @@
   <script>
   (function(){
     /*** CONFIG ***/
-    const ZOOM_LEVELS = [1, 1.5, 2]; // locked zoom steps
+    // Absolute zoom steps in "real" image scale (relative to the 1x asset).
+    // Index 0 is always "Fit to viewer" (computed dynamically).
+    const ABS_ZOOM_STEPS = [1, 1.5, 2]; // <- first zoom-in will be 1:1
+
     const ASSET_DIR = 'maps';                 // folder containing the images
     const ASSET_BASENAME = 'map';             // e.g. map@1x.webp
     const EXT = 'webp';
@@ -133,9 +136,12 @@
 
     let baseScale = 1;     // fitted scale so that 1x fills viewer by contain
     let translate = { x: 0, y: 0 };
-    let zoomIndex = 0;     // index into ZOOM_LEVELS
 
-    let assetRatio = 1;    // 0.5, 1, 1.5, 2, 2.5, 3
+    // zoomIndex == 0 => "fit to viewer" (baseScale)
+    // zoomIndex >= 1 => ABS_ZOOM_STEPS[zoomIndex-1]
+    let zoomIndex = 0;
+
+    let assetRatio = 1;    // 0.5, 1, 1.5, 2, 3
 
     // For interaction
     let isPanning = false;
@@ -144,7 +150,7 @@
 
     // Pinch state (pointer events)
     const activePointers = new Map(); // id -> {x,y}
-    let pinchInitial = null;          // {distance, center:{x,y}, zoomIndex}
+    let pinchInitial = null;          // {distance, center:{x,y}, scaleAtStart, zoomIndex}
 
     // Double-tap detection
     let lastTapTime = 0;
@@ -155,14 +161,20 @@
 
     /*** HELPERS ***/
     const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+    const nearlyEqual = (a, b, eps=1e-6) => Math.abs(a - b) <= eps;
 
     function viewport() {
       const r = canvas.getBoundingClientRect();
       return { w: r.width, h: r.height };
     }
 
+    const maxZoomIndex = () => ABS_ZOOM_STEPS.length;
+
+    function scaleAt(index){
+      return index === 0 ? baseScale : ABS_ZOOM_STEPS[index - 1];
+    }
     function currentScale(){
-      return baseScale * ZOOM_LEVELS[zoomIndex];
+      return scaleAt(zoomIndex);
     }
 
     function setTransform(){
@@ -197,13 +209,6 @@
       }
     }
 
-    function assetKeyFor(zoomIdx){
-      const vp = viewport();
-      const zoomFactor = ZOOM_LEVELS[zoomIdx];
-      if (vp.w < 512 && zoomFactor <= 1) return '0.5x';
-      return `${zoomFactor}x`;
-    }
-
     function assetUrl(key){
       return `${ASSET_DIR}/${ASSET_BASENAME}@${key}.${EXT}`;
     }
@@ -216,8 +221,25 @@
       assetCache.set(key, im);
     }
 
+    // Decide which asset to use for a given zoom index.
+    // - Fit (index 0): use 1x, but allow 0.5x on very small viewports to save bytes.
+    // - Real zooms (index >=1): match the ABS_ZOOM_STEPS exactly (1x, 1.5x, 2x, 3x, …).
+    function assetKeyFor(index){
+      const vp = viewport();
+      const cs = scaleAt(index);
+
+      if (index === 0 || cs <= 1){
+        // Fit view or <=1x: small phones can use a 0.5x asset to keep memory down.
+        if (vp.w < 512 && cs <= 1) return '0.5x';
+        return '1x';
+      }
+      // For higher zooms we expect matching assets to exist.
+      const step = ABS_ZOOM_STEPS[index - 1];
+      return `${step}x`;
+    }
+
     function switchAssetIfNeeded(){
-      const key = assetKeyFor(zoomIndex); // e.g. '3x', '2x', '1.5x', '0.5x'
+      const key = assetKeyFor(zoomIndex);
       ensurePreloaded(key);
 
       // Update the image source
@@ -230,7 +252,7 @@
       layer.style.height = (baseHeight * assetRatio) + 'px';
 
       // Preload neighbors
-      if (zoomIndex + 1 < ZOOM_LEVELS.length) ensurePreloaded(assetKeyFor(zoomIndex + 1));
+      if (zoomIndex + 1 <= maxZoomIndex()) ensurePreloaded(assetKeyFor(zoomIndex + 1));
       if (zoomIndex - 1 >= 0) ensurePreloaded(assetKeyFor(zoomIndex - 1));
 
       // Re-apply transform so the on-screen size remains consistent
@@ -239,12 +261,12 @@
 
     function updateButtons(){
       btnOut.disabled = (zoomIndex === 0);
-      btnIn.disabled  = (zoomIndex === ZOOM_LEVELS.length - 1);
+      btnIn.disabled  = (zoomIndex === maxZoomIndex());
     }
 
-    // NEW: zoom with an optional anchor (in canvas-local coords)
+    // Zoom with an optional anchor (in canvas-local coords)
     function setZoomIndex(newIndex, anchor){
-      newIndex = clamp(newIndex, 0, ZOOM_LEVELS.length - 1);
+      newIndex = clamp(newIndex, 0, maxZoomIndex());
       const vp = viewport();
 
       const s1 = currentScale();
@@ -274,8 +296,17 @@
       updateButtons();
     }
 
-    function zoomIn(anchor){ setZoomIndex(zoomIndex + 1, anchor); }
-    function zoomOut(anchor){ setZoomIndex(zoomIndex - 1, anchor); }
+    function zoomIn(anchor){
+      let ni = clamp(zoomIndex + 1, 0, maxZoomIndex());
+      // Skip no-op (e.g., going from "fit" to 1x when fit already equals 1x)
+      if (nearlyEqual(scaleAt(ni), scaleAt(zoomIndex)) && ni < maxZoomIndex()) ni++;
+      setZoomIndex(ni, anchor);
+    }
+    function zoomOut(anchor){
+      let ni = clamp(zoomIndex - 1, 0, maxZoomIndex());
+      if (nearlyEqual(scaleAt(ni), scaleAt(zoomIndex)) && ni > 0) ni--;
+      setZoomIndex(ni, anchor);
+    }
 
     /*** UI HOOKUPS ***/
     btnIn.addEventListener('click', ()=>zoomIn());
@@ -298,9 +329,9 @@
       zoomIn(anchor);
     });
 
-    // Panning + Double‑tap (touch) via pointer events
+    // Panning + Double-tap (touch) via pointer events
     canvas.addEventListener('pointerdown', (e)=>{
-      // Only detect double‑tap on TOUCH; desktop uses the dblclick event
+      // Only detect double-tap on TOUCH; desktop uses the dblclick event
       if (e.pointerType === 'touch') {
         const now = performance.now();
         const dt = now - lastTapTime;
@@ -315,8 +346,6 @@
         lastTapTime = now;
         lastTapPos = { x: e.clientX, y: e.clientY };
       }
-
-
 
       if (activePointers.size <= 1) {
         canvas.setPointerCapture(e.pointerId);
@@ -379,7 +408,7 @@
       const dx = b.x - a.x, dy = b.y - a.y;
       const distance = Math.hypot(dx, dy);
       const center = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-      return { distance, center, zoomIndex };
+      return { distance, center, scaleAtStart: currentScale(), zoomIndex };
     }
 
     function handlePinchGesture(){
@@ -388,13 +417,13 @@
 
       // Pinch delta in native CSS scale units
       const delta = now.distance / pinchInitial.distance;
-      const desiredTotalScale = baseScale * ZOOM_LEVELS[pinchInitial.zoomIndex] * delta;
+      const desiredTotalScale = pinchInitial.scaleAtStart * delta;
 
-      // Snap to closest allowed zoom level
+      // Snap to closest allowed zoom level among [fit, 1x, 1.5x, 2x, ...]
       let closestIdx = 0;
       let closestDiff = Infinity;
-      for (let i=0;i<ZOOM_LEVELS.length;i++){
-        const diff = Math.abs(baseScale * ZOOM_LEVELS[i] - desiredTotalScale);
+      for (let i = 0; i <= maxZoomIndex(); i++){
+        const diff = Math.abs(scaleAt(i) - desiredTotalScale);
         if (diff < closestDiff) { closestDiff = diff; closestIdx = i; }
       }
 
@@ -422,7 +451,7 @@
           y: (center.y - translate.y) / oldScale,
         };
         computeBaseScale();
-        const newScale = currentScale();
+        const newScale = currentScale(); // respects fit vs absolute levels
         translate.x = center.x - imagePoint.x * newScale;
         translate.y = center.y - imagePoint.y * newScale;
         clampTranslate();
@@ -439,8 +468,8 @@
       boot.src = assetUrl('1x');
       await boot.decode();
 
-      baseWidth  = boot.naturalWidth;   // 1024
-      baseHeight = boot.naturalHeight;  // 768
+      baseWidth  = boot.naturalWidth;   // e.g. 1024
+      baseHeight = boot.naturalHeight;  // e.g. 768
 
       // Lock initial logical size on the wrapper
       layer.style.width  = baseWidth + 'px';
@@ -457,7 +486,7 @@
       setTransform();
       updateButtons();
 
-      // Preload adjacent zoom assets for snappy first interaction
+      // Preload the first "real" zoom level (1x)
       ensurePreloaded(assetKeyFor(1));
     })();
   })();
