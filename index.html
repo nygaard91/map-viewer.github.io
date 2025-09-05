@@ -36,7 +36,7 @@
     .canvas{
       position:absolute; inset:0;
       overflow:hidden;
-      touch-action: none; /* enables custom pan & pinch */
+      touch-action: none; /* enables custom pan & pinch (and disables browser dbl-tap zoom) */
       cursor: grab;
       user-select: none;
       -webkit-user-select: none;
@@ -47,7 +47,7 @@
     }
     .canvas.grabbing{ cursor: grabbing; }
 
-    /* NEW: wrapper layer that receives the transform and box-shadow */
+    /* Wrapper layer that receives the transform and box-shadow */
     .mapLayer{
       position:absolute; top:0; left:0;
       transform-origin: 0 0;
@@ -96,7 +96,6 @@
 <body>
   <div class="viewer" id="viewer" aria-label="Map viewer">
     <div class="canvas" id="canvas" aria-live="polite">
-      <!-- NEW wrapper -->
       <div id="mapLayer" class="mapLayer">
         <img id="mapImage" alt="Map" draggable="false" />
       </div>
@@ -116,7 +115,7 @@
   <script>
   (function(){
     /*** CONFIG ***/
-    const ZOOM_LEVELS = [1, 1.5, 2, 2.5, 3]; // locked zoom steps
+    const ZOOM_LEVELS = [1, 1.5, 2]; // locked zoom steps
     const ASSET_DIR = 'maps';                 // folder containing the images
     const ASSET_BASENAME = 'map';             // e.g. map@1x.webp
     const EXT = 'webp';
@@ -124,7 +123,7 @@
     /*** STATE ***/
     const viewer = document.getElementById('viewer');
     const canvas = document.getElementById('canvas');
-    const layer  = document.getElementById('mapLayer');   // NEW wrapper
+    const layer  = document.getElementById('mapLayer');
     const img    = document.getElementById('mapImage');
     const btnIn  = document.getElementById('zoomIn');
     const btnOut = document.getElementById('zoomOut');
@@ -136,7 +135,7 @@
     let translate = { x: 0, y: 0 };
     let zoomIndex = 0;     // index into ZOOM_LEVELS
 
-    let assetRatio = 1;    // NEW: 0.5, 1, 1.5, 2, 2.5, 3
+    let assetRatio = 1;    // 0.5, 1, 1.5, 2, 2.5, 3
 
     // For interaction
     let isPanning = false;
@@ -146,6 +145,10 @@
     // Pinch state (pointer events)
     const activePointers = new Map(); // id -> {x,y}
     let pinchInitial = null;          // {distance, center:{x,y}, zoomIndex}
+
+    // Double-tap detection
+    let lastTapTime = 0;
+    let lastTapPos = {x:0, y:0};
 
     // Asset cache
     const assetCache = new Map(); // key -> HTMLImageElement (preloaded)
@@ -195,14 +198,9 @@
     }
 
     function assetKeyFor(zoomIdx){
-      // Decide which image asset to use for a given zoom index, with a small-viewport override.
       const vp = viewport();
       const zoomFactor = ZOOM_LEVELS[zoomIdx];
-
-      // If the viewer is narrower than 512px and we're at the base zoom (1x), prefer the 0.5x asset.
-      if (vp.w < 512 && zoomFactor <= 1) {
-        return '0.5x';
-      }
+      if (vp.w < 512 && zoomFactor <= 1) return '0.5x';
       return `${zoomFactor}x`;
     }
 
@@ -244,13 +242,19 @@
       btnIn.disabled  = (zoomIndex === ZOOM_LEVELS.length - 1);
     }
 
-    function setZoomIndex(newIndex){
+    // NEW: zoom with an optional anchor (in canvas-local coords)
+    function setZoomIndex(newIndex, anchor){
       newIndex = clamp(newIndex, 0, ZOOM_LEVELS.length - 1);
       const vp = viewport();
 
-      // Keep the current view center stable while zooming
       const s1 = currentScale();
-      const viewPoint = { x: vp.w/2, y: vp.h/2 };
+      let viewPoint;
+      if (anchor && Number.isFinite(anchor.x) && Number.isFinite(anchor.y)) {
+        viewPoint = { x: anchor.x, y: anchor.y };
+      } else {
+        viewPoint = { x: vp.w/2, y: vp.h/2 };
+      }
+
       const imagePoint = { // convert from view-space to image-space (pre-transform)
         x: (viewPoint.x - translate.x) / s1,
         y: (viewPoint.y - translate.y) / s1
@@ -260,33 +264,60 @@
       zoomIndex = newIndex;
 
       const s2 = currentScale();
-      // Recompute translate to keep imagePoint under the same view center
+      // Recompute translate to keep imagePoint under the chosen viewPoint
       translate.x = viewPoint.x - imagePoint.x * s2;
       translate.y = viewPoint.y - imagePoint.y * s2;
 
       clampTranslate();
-      switchAssetIfNeeded(); // may change assetRatio
+      switchAssetIfNeeded();
       setTransform();
       updateButtons();
     }
 
-    function zoomIn(){ setZoomIndex(zoomIndex + 1); }
-    function zoomOut(){ setZoomIndex(zoomIndex - 1); }
+    function zoomIn(anchor){ setZoomIndex(zoomIndex + 1, anchor); }
+    function zoomOut(anchor){ setZoomIndex(zoomIndex - 1, anchor); }
 
     /*** UI HOOKUPS ***/
-    btnIn.addEventListener('click', zoomIn);
-    btnOut.addEventListener('click', zoomOut);
+    btnIn.addEventListener('click', ()=>zoomIn());
+    btnOut.addEventListener('click', ()=>zoomOut());
 
-    // Wheel to zoom (no modifiers)
+    // Wheel to zoom (anchored to cursor position)
     canvas.addEventListener('wheel', (e)=>{
       if (e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return;
       e.preventDefault();
-      if (e.deltaY < 0) zoomIn(); else zoomOut();
+      const rect = canvas.getBoundingClientRect();
+      const anchor = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      if (e.deltaY < 0) zoomIn(anchor); else zoomOut(anchor);
     }, { passive: false });
 
-    // Panning via pointer events
+    // Double-click to zoom in (desktop)
+    canvas.addEventListener('dblclick', (e)=>{
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const anchor = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      zoomIn(anchor);
+    });
+
+    // Panning + Double‑tap (touch) via pointer events
     canvas.addEventListener('pointerdown', (e)=>{
-      // ignore if a second pointer is starting (pinch will handle)
+      // Only detect double‑tap on TOUCH; desktop uses the dblclick event
+      if (e.pointerType === 'touch') {
+        const now = performance.now();
+        const dt = now - lastTapTime;
+        const dist = Math.hypot(e.clientX - lastTapPos.x, e.clientY - lastTapPos.y);
+        if (dt < 300 && dist < 20 && activePointers.size === 0) {
+          const rect = canvas.getBoundingClientRect();
+          const anchor = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+          zoomIn(anchor);
+          lastTapTime = 0;
+          return;
+        }
+        lastTapTime = now;
+        lastTapPos = { x: e.clientX, y: e.clientY };
+      }
+
+
+
       if (activePointers.size <= 1) {
         canvas.setPointerCapture(e.pointerId);
       }
@@ -331,7 +362,6 @@
         pinchInitial = null;
         canvas.classList.remove('grabbing');
       } else if (activePointers.size === 1) {
-        // fall back to panning state after pinch ends
         const [only] = activePointers.values();
         panStart = { ...only };
         translateStart = { ...translate };
@@ -369,11 +399,12 @@
       }
 
       if (closestIdx !== zoomIndex) {
-        // Preserve the view center while zooming
-        setZoomIndex(closestIdx);
+        // Preserve the pinch center while zooming
+        const rect = canvas.getBoundingClientRect();
+        const anchor = { x: now.center.x - rect.left, y: now.center.y - rect.top };
+        setZoomIndex(closestIdx, anchor);
       }
 
-      // clamp & apply
       clampTranslate();
       setTransform();
     }
