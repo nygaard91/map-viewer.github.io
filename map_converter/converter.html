@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>SVG → WEBP (Barebones)</title>
+</head>
+<body>
+  <h1>SVG → WEBP</h1>
+
+  <label>
+    SVG file:
+    <input id="fileInput" type="file" accept=".svg,image/svg+xml">
+  </label>
+  <button id="exportBtn" disabled>Export WEBPs</button>
+
+  <div id="info"></div>
+  <ul id="outputs"></ul>
+
+  <script>
+    // --- Config (edit to fit your project) ---
+    const SCALES  = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]; // export factors
+    const QUALITY = 0.8;                              // WEBP quality
+
+    // --- Elements ---
+    const fileInput = document.getElementById('fileInput');
+    const exportBtn = document.getElementById('exportBtn');
+    const outputs   = document.getElementById('outputs');
+    const info      = document.getElementById('info');
+
+    // --- State ---
+    let currentFile = null;
+    let svgText = '';
+    let baseW = 1024, baseH = 768; // falls back if SVG size not found
+    let imgURL = null;
+
+    fileInput.addEventListener('change', async () => {
+      reset();
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      if (file.type !== 'image/svg+xml' && !file.name.toLowerCase().endsWith('.svg')) {
+        info.textContent = 'Please choose an SVG file.';
+        return;
+      }
+      currentFile = file;
+
+      // Read SVG and detect dimensions
+      svgText = await file.text();
+      const dim = parseSvgSize(svgText);
+      baseW = dim.width || 1024;
+      baseH = dim.height || 768;
+
+      info.textContent = `Detected size: ${baseW}×${baseH}px (${dim.note})`;
+
+      if (imgURL) URL.revokeObjectURL(imgURL);
+      imgURL = URL.createObjectURL(file);
+
+      exportBtn.disabled = false;
+    });
+
+    exportBtn.addEventListener('click', async () => {
+      if (!currentFile) return;
+      if (!supportsWebP()) {
+        info.textContent = 'Your browser does not support WEBP export.';
+        return;
+      }
+      exportBtn.disabled = true;
+      outputs.innerHTML = '';
+
+      const img = new Image();
+      img.decoding = 'async';
+      img.onload = async () => {
+        for (const scale of SCALES) {
+          try {
+            const { url, filename, w, h, sizeKB } = await renderScaledWebP(img, scale, baseW, baseH);
+            const li = document.createElement('li');
+            const a  = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            a.textContent = `${filename} — ${w}×${h} — ${sizeKB.toFixed(1)} KB`;
+            li.appendChild(a);
+            outputs.appendChild(li);
+
+            // Revoke after a short delay post-click to let download start
+            a.addEventListener('click', () => setTimeout(() => URL.revokeObjectURL(url), 4000), { once: true });
+          } catch (err) {
+            const li = document.createElement('li');
+            li.textContent = `${scale}× — ${err.message || err}`;
+            outputs.appendChild(li);
+          }
+        }
+        exportBtn.disabled = false;
+      };
+      img.onerror = () => {
+        info.textContent = 'Failed to load the SVG. If it references external assets without CORS, export may be blocked.';
+        exportBtn.disabled = false;
+      };
+      img.src = imgURL;
+    });
+
+    function reset() {
+      if (imgURL) { URL.revokeObjectURL(imgURL); imgURL = null; }
+      outputs.innerHTML = '';
+      info.textContent = '';
+      exportBtn.disabled = true;
+    }
+
+    function parseSvgSize(text) {
+      const vb = /viewBox=["']\s*([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s*["']/i.exec(text);
+      const wAttr = /\bwidth=["']([^"']+)["']/i.exec(text);
+      const hAttr = /\bheight=["']([^"']+)["']/i.exec(text);
+      let width = null, height = null, note = '';
+      const strip = v => v ? parseFloat(String(v).replace(/[^\d.+-]/g, '')) : null;
+
+      if (wAttr && hAttr) {
+        width = strip(wAttr[1]); height = strip(hAttr[1]); note = 'width/height';
+      } else if (vb) {
+        width = strip(vb[3]); height = strip(vb[4]); note = 'viewBox';
+      } else {
+        note = 'defaulted (1024×768)';
+      }
+      if (!(width > 0 && height > 0)) { width = null; height = null; }
+      return { width, height, note };
+    }
+
+    function supportsWebP() {
+      const c = document.createElement('canvas');
+      try { return c.toDataURL('image/webp').startsWith('data:image/webp'); }
+      catch { return false; }
+    }
+
+    function canvasToWebPBlob(canvas, quality = QUALITY) {
+      return new Promise((resolve, reject) => {
+        try {
+          canvas.toBlob(b => b ? resolve(b) : reject(new Error('Export failed (canvas tainted or blocked).')),
+                        'image/webp', quality);
+        } catch (e) { reject(e); }
+      });
+    }
+
+    async function renderScaledWebP(img, scale, baseW, baseH) {
+      const w = Math.round(baseW * scale);
+      const h = Math.round(baseH * scale);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+
+      const blob = await canvasToWebPBlob(canvas, QUALITY);
+      const url = URL.createObjectURL(blob);
+
+      const nameBase = (currentFile?.name || 'export').replace(/\.[^.]+$/, '');
+      const filename = `${nameBase}@${scale}x.webp`;
+
+      return { url, filename, w, h, sizeKB: blob.size / 1024 };
+    }
+  </script>
+</body>
+</html>
